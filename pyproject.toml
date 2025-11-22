@@ -1,14 +1,17 @@
 [project]
-name = "template"
-version = "0.2.1"
-description = "Add your description here and change the repo name"
+name = "opensafety-ai"
+version = "0.3.0"
+description = "OpenSafety AI Corporation of America - Defensive AI gateway with split-up attack detection"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "python-dotenv",
-    "pydantic",
+    "pydantic>=2.0",
     "requests>=2.32.4",
     "fastapi[standard]>=0.116.1",
+    "httpx>=0.27.0",
+    "sse-starlette>=2.0.0",
+    "tiktoken>=0.7.0",
 ]
 
 [dependency-groups]
