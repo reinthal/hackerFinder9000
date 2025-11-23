@@ -1,0 +1,3 @@
+[submodule "RED-Apt"]
+	path = RED-Apt
+	url = https://github.com/reinthal/RED-Apt.git
