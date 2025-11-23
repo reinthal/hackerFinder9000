@@ -11,13 +11,15 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from detection.analyzer import (
@@ -29,6 +31,16 @@ from detection.tracker import (
     TrackedRequest,
     create_request_id,
 )
+from detection.ml_detector import ThreatDetector, get_detector, score_text
+from detection.threat_ontology import (
+    ThreatKnowledgeBase,
+    ThreatDiscoveryAgent,
+    AutonomousThreatGenerator,
+    ThreatDomain,
+    get_threat_taxonomy,
+    run_threat_discovery,
+)
+from detection.attack_genes import get_gene_pool, GeneCategory
 from middelwares.request_logging import RequestLoggingMiddleware
 from models.openai_compat import (
     ChatCompletionChunk,
@@ -57,9 +69,10 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # vLLM Configuration
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8001/v1")
 VLLM_API_KEY = os.getenv("VLLM_API_KEY", "")
+VLLM_DEFAULT_MODEL = os.getenv("VLLM_DEFAULT_MODEL", "huihui-ai/Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated")
 
 # General Configuration
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "openai/gpt-4o-mini")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", VLLM_DEFAULT_MODEL if BACKEND_TYPE == "vllm" else "openai/gpt-4o-mini")
 BLOCKING_ENABLED = os.getenv("BLOCKING_ENABLED", "false").lower() == "true"
 BLOCKING_THRESHOLD = float(os.getenv("BLOCKING_THRESHOLD", "0.8"))
 
@@ -79,12 +92,16 @@ def get_backend_config():
 request_tracker: Optional[RequestTracker] = None
 threat_analyzer: Optional[ThreatAnalyzer] = None
 http_client: Optional[httpx.AsyncClient] = None
+threat_knowledge_base: Optional[ThreatKnowledgeBase] = None
+threat_discovery_agent: Optional[ThreatDiscoveryAgent] = None
+ml_detector: Optional[ThreatDetector] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
     global request_tracker, threat_analyzer, http_client
+    global threat_knowledge_base, threat_discovery_agent, ml_detector
 
     # Startup
     request_tracker = RequestTracker(
@@ -100,6 +117,14 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(120.0, connect=10.0),
         limits=httpx.Limits(max_connections=1000, max_keepalive_connections=100),
     )
+
+    # Initialize threat ontology and discovery system
+    threat_knowledge_base = ThreatKnowledgeBase()
+    generator = AutonomousThreatGenerator(threat_knowledge_base)
+    threat_discovery_agent = ThreatDiscoveryAgent(generator)
+
+    # Initialize ML detector
+    ml_detector = get_detector()
 
     yield
 
@@ -129,6 +154,11 @@ app.add_middleware(
 
 # Request logging middleware - processes before all other middleware
 app.add_middleware(RequestLoggingMiddleware, log_file=LOG_FILE)
+
+# Static files for dashboard UI
+static_path = Path(__file__).parent / "static"
+if static_path.exists():
+    app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
 
 
 # ============================================================================
@@ -164,7 +194,7 @@ async def root():
     """Root endpoint with service info."""
     return {
         "service": "OpenSafety AI Corporation of America",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "status": "operational",
         "endpoints": {
             "chat": "/v1/chat/completions",
@@ -172,6 +202,11 @@ async def root():
             "health": "/health",
             "stats": "/stats",
             "threats": "/threats/recent",
+            "taxonomy": "/threats/taxonomy",
+            "discovery": "/threats/discover",
+            "gene_pool": "/threats/gene-pool",
+            "ml_score": "/ml/score",
+            "dashboard": "/dashboard",
         },
     }
 
@@ -834,6 +869,205 @@ async def fingerprint_stats():
 
 
 # ============================================================================
+# Threat Ontology & Discovery Endpoints
+# ============================================================================
+
+
+@app.get("/threats/taxonomy")
+async def get_taxonomy():
+    """Get the complete threat taxonomy."""
+    return {
+        "taxonomy": get_threat_taxonomy(),
+        "domains": [d.value for d in ThreatDomain],
+    }
+
+
+@app.get("/threats/knowledge-base")
+async def get_knowledge_base_info():
+    """Get threat knowledge base information."""
+    if not threat_knowledge_base:
+        raise HTTPException(status_code=503, detail="Knowledge base not initialized")
+
+    vectors = list(threat_knowledge_base.vectors.values())
+    return {
+        "total_vectors": len(vectors),
+        "vectors_by_domain": {
+            domain.value: len([v for v in vectors if v.domain == domain])
+            for domain in ThreatDomain
+        },
+        "high_risk_vectors": [
+            {
+                "name": v.name,
+                "path": v.full_path,
+                "risk_score": v.risk_score,
+                "severity": v.severity,
+                "detectability": v.detectability,
+            }
+            for v in threat_knowledge_base.get_high_risk_vectors(0.7)
+        ],
+        "all_patterns_count": len(threat_knowledge_base.get_all_patterns()),
+    }
+
+
+@app.post("/threats/discover")
+async def run_discovery(
+    domain: Optional[str] = None,
+    max_patterns: int = 100,
+):
+    """Run a threat discovery session to generate new attack variants."""
+    if not threat_discovery_agent:
+        raise HTTPException(status_code=503, detail="Discovery agent not initialized")
+
+    focus_domain = None
+    if domain:
+        try:
+            focus_domain = ThreatDomain(domain)
+        except ValueError:
+            raise HTTPException(  # noqa: B904
+                status_code=400,
+                detail=f"Invalid domain. Valid: {[d.value for d in ThreatDomain]}",
+            )
+
+    report = threat_discovery_agent.run_discovery_session(
+        focus_domain=focus_domain,
+        max_patterns=max_patterns,
+    )
+
+    return {
+        "session_id": report.session_id,
+        "domain": report.domain_explored.value if report.domain_explored else "all",
+        "patterns_generated": report.patterns_generated,
+        "novel_patterns": report.novel_patterns,
+        "high_risk_samples": [
+            {
+                "pattern": t.generated_pattern[:100] + "..."
+                if len(t.generated_pattern) > 100
+                else t.generated_pattern,
+                "strategy": t.mutation_strategy,
+                "effectiveness": t.estimated_effectiveness,
+                "novelty": t.novelty_score,
+            }
+            for t in report.high_risk_patterns[:10]
+        ],
+        "coverage": report.coverage_by_technique,
+        "recommendations": report.recommendations,
+    }
+
+
+@app.get("/threats/gene-pool")
+async def get_gene_pool_info():
+    """Get attack gene pool statistics."""
+    pool = get_gene_pool()
+    stats = pool.stats()
+
+    return {
+        "total_genes": stats["total_genes"],
+        "avg_severity": stats["avg_severity"],
+        "high_severity_count": stats["high_severity_count"],
+        "categories": stats["categories"],
+        "sample_high_severity": [
+            {
+                "pattern": g.pattern[:80] + "..." if len(g.pattern) > 80 else g.pattern,
+                "category": g.category.value,
+                "severity": g.severity,
+                "tags": g.tags,
+            }
+            for g in pool.get_high_severity(0.9)[:10]
+        ],
+    }
+
+
+# ============================================================================
+# ML Detector Endpoints
+# ============================================================================
+
+
+class MLScoreRequest(BaseModel):
+    """Request for ML threat scoring."""
+
+    text: str
+    include_signals: bool = True
+
+
+@app.post("/ml/score")
+async def ml_score_text(request_body: MLScoreRequest):
+    """Score text using ML-based threat detector."""
+    if not ml_detector:
+        raise HTTPException(status_code=503, detail="ML detector not initialized")
+
+    result = ml_detector.score(request_body.text)
+
+    response = {
+        "score": result.score,
+        "confidence": result.confidence,
+        "category": result.category,
+        "is_threat": result.score > ml_detector.threshold,
+        "threshold": ml_detector.threshold,
+    }
+
+    if request_body.include_signals:
+        response["signals"] = result.signals
+
+    return response
+
+
+@app.post("/ml/score-batch")
+async def ml_score_batch(texts: list[str]):
+    """Score multiple texts using ML detector."""
+    if not ml_detector:
+        raise HTTPException(status_code=503, detail="ML detector not initialized")
+
+    results = ml_detector.score_batch(texts)
+
+    return {
+        "results": [
+            {
+                "text": text[:50] + "..." if len(text) > 50 else text,
+                "score": r.score,
+                "category": r.category,
+                "is_threat": r.score > ml_detector.threshold,
+            }
+            for text, r in zip(texts, results)
+        ],
+        "summary": {
+            "total": len(results),
+            "threats": sum(1 for r in results if r.score > ml_detector.threshold),
+            "avg_score": sum(r.score for r in results) / len(results) if results else 0,
+        },
+    }
+
+
+@app.get("/ml/stats")
+async def ml_detector_stats():
+    """Get ML detector statistics."""
+    if not ml_detector:
+        raise HTTPException(status_code=503, detail="ML detector not initialized")
+
+    return {
+        "detector_type": "ThreatDetector",
+        "n_features": ml_detector.hasher.n_features,
+        "threshold": ml_detector.threshold,
+        "attack_patterns_loaded": len(ml_detector.attack_vectors),
+        "benign_patterns_loaded": len(ml_detector.benign_vectors),
+        "feature_weights": ml_detector.feature_weights,
+    }
+
+
+# ============================================================================
+# Dashboard UI Endpoint
+# ============================================================================
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Serve the dashboard UI."""
+    dashboard_path = Path(__file__).parent / "static" / "index.html"
+    if dashboard_path.exists():
+        return FileResponse(dashboard_path)
+    return {"message": "Dashboard not available", "hint": "Static files not found"}
+
+
+# ============================================================================
 # Legacy Utility Endpoints (from template)
 # ============================================================================
 
@@ -856,13 +1090,19 @@ async def demo():
             "Structural pattern analysis",
             "High-entropy content detection",
             "Entity extraction (URLs, IPs, API keys)",
+            "ML-based threat detection (feature hashing + cosine similarity)",
+            "600+ attack gene patterns for classification",
+            "Autonomous threat discovery & mutation",
+            "Threat taxonomy & knowledge base",
         ],
         "detection_methods": {
             "pattern_matching": "Regex-based injection/jailbreak detection",
             "behavioral_analysis": "Rate limiting and burst detection",
-            "fingerprint_similarity": "MinHash Jaccard similarity + SimHash hamming distance",  # noqa: E501
+            "fingerprint_similarity": "MinHash Jaccard similarity + SimHash hamming distance",
             "semantic_clustering": "Keyword-based semantic hashing",
             "campaign_detection": "Cross-IP content correlation",
+            "ml_detection": "Feature hashing + corpus similarity scoring",
+            "threat_ontology": "Hierarchical threat taxonomy with mutation strategies",
         },
         "status": "operational",
         "backend_type": BACKEND_TYPE,

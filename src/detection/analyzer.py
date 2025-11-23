@@ -13,6 +13,7 @@ from detection.fingerprint import (
 )
 from detection.patterns import AttackPattern, AttackPatternType, SplitAttackDetector
 from detection.tracker import RequestTracker, TrackedRequest, hash_api_key, hash_content
+from detection.ml_detector import get_detector
 
 
 class ThreatLevel(str, Enum):
@@ -113,6 +114,9 @@ class ThreatAnalyzer:
         # Advanced fingerprinting for similarity detection
         self.fingerprinter = AdvancedFingerprinter() if enable_fingerprinting else None
 
+        # ML-based threat detector (scalable, stateless)
+        self.ml_detector = get_detector()
+
         # Track repeat offenders (IPs with multiple high-threat requests)
         self._offender_scores: dict[str, float] = {}
 
@@ -151,7 +155,46 @@ class ThreatAnalyzer:
         if api_key:
             request.api_key_hash = hash_api_key(api_key)
 
-        # 1. Pattern-based detection
+        # 1. ML-based detection (primary, scalable)
+        full_content = " ".join(message_contents)
+        ml_result = self.ml_detector.score(full_content)
+
+        if ml_result.score > 0.3:
+            signals.append(
+                ThreatSignal(
+                    name=f"ml_{ml_result.category}",
+                    score=ml_result.score,
+                    description=f"ML detector: {ml_result.category} ({ml_result.score:.1%} confidence)",
+                    category="ml_detection",
+                    metadata={"signals": ml_result.signals, "ml_confidence": ml_result.confidence},
+                )
+            )
+
+            # Convert to attack pattern for compatibility
+            pattern_type_map = {
+                "injection": AttackPatternType.INSTRUCTION_INJECTION,
+                "extraction": AttackPatternType.PROMPT_LEAK,
+                "manipulation": AttackPatternType.ROLE_CONFUSION,
+                "jailbreak": AttackPatternType.JAILBREAK_SEQUENCE,
+                "exfiltration": AttackPatternType.DATA_EXFILTRATION,
+            }
+            pattern_type = pattern_type_map.get(
+                ml_result.category, AttackPatternType.INSTRUCTION_INJECTION
+            )
+
+            if ml_result.score > 0.5:
+                all_patterns.append(
+                    AttackPattern(
+                        pattern_type=pattern_type,
+                        confidence=ml_result.confidence,
+                        severity=ml_result.score,
+                        description=f"ML detected {ml_result.category}",
+                        evidence=ml_result.signals[:3],
+                        related_requests=[request.request_id],
+                    )
+                )
+
+        # 2. Pattern-based detection
         patterns = self.detector.analyze_request(
             request, message_contents, system_prompt
         )
