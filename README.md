@@ -1,11 +1,17 @@
-<img width="346" height="346" alt="image" src="https://github.com/user-attachments/assets/c99f2e5f-515f-4608-8d19-2ae266a19ded" />
+# Detecting Piecewise Cyber Espionage in Model APIs
+
 
 <a href="https://www.youtube.com/watch?v=cnrPMUqGYBw">
   <img src="https://img.youtube.com/vi/cnrPMUqGYBw/0.jpg" alt="Video Title" width="400">
 </a>
 
-# What is this?
+## Abstract
+
+On November 13th 2025, Anthropic published a report on an AI-orchestrated cyber espionage campaign. Threat actors used various techniques to circumvent model safeguards and used Claude Code with agentic scaffolding to automate large parts of their campaigns. Specifically, threat actors split campaigns into subtasks that in isolation appeared benign. It is therefore important to find methods to protect against such attacks to ensure that misuse of AI in the cyber domain can be minimized. To address this, we propose a novel method for detecting malicious activity in model APIs across piecewise benign requests. We simulated malicious campaigns using an agentic red-team scaffold similar to what was described in the reported attack. We demonstrate that individual attacks are blocked by simple guardrails using Llama Guard 3. Then, we demonstrate that by splitting up the attack, this bypasses the guardrail. For the attacks that get through, a classifier model is introduced that detects those attacks, and a statistical validation of the detections is provided. This result paves the way to detect future automated attacks of this kind.
+
 
 Part of the def/acc Apart hackathon
 
-See this [Detecting Piecewise  yber Espionage in Model APIs](https://apartresearch.com/project/detecting-piecewise-cyber-espionage-in-model-apis-a8gx).
+See this [Detecting Piecewise Cyber Espionage in Model APIs](https://apartresearch.com/project/detecting-piecewise-cyber-espionage-in-model-apis-a8gx).
+
+
